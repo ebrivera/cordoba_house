@@ -1,415 +1,221 @@
 import os
-import csv
-import requests
-import base64
-from dotenv import load_dotenv
-from pathlib import Path
 import json
-from datetime import datetime
+import time
+import argparse
+import base64
 import hashlib
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+import requests
+from dotenv import load_dotenv
 
 load_dotenv()
 
+
 class ZoomDownloader:
-    def __init__(self):
+    """
+    Download and manage Zoom cloud recordings for given user emails.
+
+    Supports comprehensive date-range searches, caching of processed meetings,
+    and optional diagnostic output behind flags.
+    """
+    def __init__(self, downloads_dir="downloads", metadata_dir="metadata", verbose=False):
         self.client_id = os.getenv("ZOOM_CLIENT_ID")
         self.client_secret = os.getenv("ZOOM_CLIENT_SECRET")
         self.account_id = os.getenv("ZOOM_ACCOUNT_ID")
         self.api_base = "https://api.zoom.us/v2"
-        
-        # Create directories
-        self.downloads_dir = Path("downloads")
-        self.metadata_dir = Path("metadata")
+
+        self.downloads_dir = Path(downloads_dir)
+        self.metadata_dir = Path(metadata_dir)
         self.downloads_dir.mkdir(exist_ok=True)
         self.metadata_dir.mkdir(exist_ok=True)
-        
-        # Track processed recordings to avoid re-downloads
+
         self.processed_file = self.metadata_dir / "processed_meetings.json"
         self.processed_meetings = self.load_processed_meetings()
-    
+        self.verbose = verbose
+
     def load_processed_meetings(self):
-        """Load list of already processed meetings"""
         if self.processed_file.exists():
             with open(self.processed_file, 'r') as f:
                 return set(json.load(f))
         return set()
-    
+
+    def save_processed_meetings(self):
+        with open(self.processed_file, 'w') as f:
+            json.dump(list(self.processed_meetings), f)
+
     def show_processed_summary(self):
-        """Show summary of what's already been processed"""
+        """Print a summary of already processed meetings."""
         if not self.processed_meetings:
             print("📋 No meetings processed yet")
             return
-        
-        print(f"📋 Already processed {len(self.processed_meetings)} meeting recordings:")
-        
-        # Try to get more details from latest metadata file
-        latest_metadata = self.get_latest_metadata_file()
-        if latest_metadata:
-            with open(latest_metadata, 'r') as f:
-                metadata_list = json.load(f)
-            
-            # Group by date and topic
-            from collections import defaultdict
+
+        latest = max(self.metadata_dir.glob("downloads_*.json"), default=None, key=lambda p: p.stat().st_mtime)
+        print(f"📋 Already processed {len(self.processed_meetings)} recordings")
+        if self.verbose and latest:
+            with open(latest) as f:
+                data = json.load(f)
             by_date = defaultdict(list)
-            
-            for item in metadata_list:
-                date_key = item.get('date_key', item.get('start_time', '')[:10])
-                by_date[date_key].append(item)
-            
-            for date in sorted(by_date.keys()):
-                items = by_date[date]
-                topics = set(item['topic'] for item in items)
-                file_count = len(items)
-                print(f"   {date}: {len(topics)} meetings, {file_count} files")
-                for topic in sorted(topics):
-                    topic_items = [item for item in items if item['topic'] == topic]
-                    types = [item['recording_type'] for item in topic_items]
-                    print(f"     • {topic[:50]}... ({', '.join(set(types))})")
-        else:
-            print(f"   {len(self.processed_meetings)} recordings (run with -v for details)")
-    
-    def get_latest_metadata_file(self):
-        """Get the most recent metadata file"""
-        files = list(self.metadata_dir.glob("downloads_*.json"))
-        if files:
-            return max(files, key=lambda p: p.stat().st_mtime)
-        return None
-    
+            for item in data:
+                key = item.get('date_key', item.get('start_time','')[:10])
+                by_date[key].append(item)
+            for date in sorted(by_date):
+                topics = {i['topic'] for i in by_date[date]}
+                print(f"  {date}: {len(topics)} meetings, {len(by_date[date])} files")
+
     def clear_processed_cache(self):
-        """Clear the processed meetings cache (force re-download)"""
+        """Force re-download by clearing cache."""
         if self.processed_file.exists():
-            backup_file = self.metadata_dir / f"processed_meetings_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            self.processed_file.rename(backup_file)
-            print(f"📋 Cleared processed cache (backup saved to {backup_file.name})")
-        
+            backup = self.metadata_dir / f"processed_meetings_backup_{datetime.now():%Y%m%d_%H%M%S}.json"
+            self.processed_file.rename(backup)
+            print(f"🔄 Cleared cache (backup: {backup.name})")
         self.processed_meetings.clear()
-        print("🔄 All meetings will be re-downloaded on next run")
-    
+
     def get_zoom_token(self):
-        """Get Zoom API access token"""
+        """Obtain OAuth access token for Zoom API."""
         creds = f"{self.client_id}:{self.client_secret}"
         encoded = base64.b64encode(creds.encode()).decode()
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Authorization": f"Basic {encoded}"
-        }
-        data = {
-            "grant_type": "account_credentials",
-            "account_id": self.account_id
-        }
-        
+        headers = {"Content-Type": "application/x-www-form-urlencoded",
+                   "Authorization": f"Basic {encoded}"}
+        data = {"grant_type": "account_credentials", "account_id": self.account_id}
         resp = requests.post("https://zoom.us/oauth/token", headers=headers, data=data)
         resp.raise_for_status()
         return resp.json()["access_token"]
-    
+
     def get_user_id(self, email, token):
-        """Get user ID from email"""
         url = f"{self.api_base}/users/{email}"
         headers = {"Authorization": f"Bearer {token}"}
         r = requests.get(url, headers=headers)
         r.raise_for_status()
         return r.json()["id"]
-    
-    def get_all_recordings(self, user_email, date_ranges=None):
-        """Get all recordings for a user across specified date ranges"""
-        if date_ranges is None:
-            # Extended date ranges to catch everything (last 5 years)
-            date_ranges = [
-                ("2020-01-01", "2020-12-31"),
-                ("2021-01-01", "2021-12-31"),
-                ("2022-01-01", "2022-06-30"),
-                ("2022-07-01", "2022-12-31"), 
-                ("2023-01-01", "2023-06-30"),
-                ("2023-07-01", "2023-12-31"),
-                ("2024-01-01", "2024-06-30"),
-                ("2024-07-01", "2024-12-31"),
-                ("2025-01-01", "2025-12-31")
-            ]
-        
-        token = self.get_zoom_token()
-        user_id = self.get_user_id(user_email, token)
-        
-        all_recordings = []
-        total_meetings_found = 0
-        
-        for start_date, end_date in date_ranges:
-            print(f"📅 Searching {start_date} to {end_date} for {user_email}")
-            
-            url = f"{self.api_base}/users/{user_id}/recordings"
-            headers = {"Authorization": f"Bearer {token}"}
-            params = {
-                "page_size": 300,  # Maximum allowed
-                "from": start_date,
-                "to": end_date,
-                "mc": "false"  # Include meetings without recordings
-            }
-            
-            page_num = 1
-            period_meetings = 0
-            
-            while True:
-                try:
-                    r = requests.get(url, headers=headers, params=params)
-                    if r.ok:
-                        data = r.json()
-                        meetings = data.get("meetings", [])
-                        page_count = data.get("page_count", 1)
-                        total_size = data.get("total_size", 0)
-                        
-                        print(f"   Page {page_num}/{page_count}: Found {len(meetings)} meetings (Total in period: {total_size})")
-                        period_meetings += len(meetings)
-                        
-                        for meeting in meetings:
-                            recording_files = []
-                            raw_files = meeting.get('recording_files', [])
-                            
-                            # Debug: show what we're finding
-                            if len(raw_files) == 0:
-                                print(f"     ⚠️  Meeting '{meeting.get('topic', 'Unknown')}' has no recording files")
-                                continue
-                            
-                            for rf in raw_files:
-                                # Include ALL file types
-                                recording_files.append({
-                                    "recording_type": rf.get('recording_type'),
-                                    "file_type": rf.get('file_type'),
-                                    "file_size": rf.get('file_size', 0),
-                                    "download_url": f"{rf['download_url']}?access_token={token}" if rf.get('download_url') else None,
-                                    "file_extension": rf.get('file_extension', rf.get('file_type', '').lower()),
-                                    "recording_start": rf.get('recording_start', ''),
-                                    "recording_end": rf.get('recording_end', ''),
-                                    "status": rf.get('status', 'completed')
-                                })
-                            
-                            if recording_files:  # Only include meetings with actual recording files
-                                meeting_data = {
-                                    "user_email": user_email,
-                                    "topic": meeting.get('topic'),
-                                    "start_time": meeting.get('start_time'),
-                                    "duration": meeting.get('duration'),
-                                    "meeting_id": meeting.get('id'),
-                                    "uuid": meeting.get('uuid'),  # Add UUID for better tracking
-                                    "recording_count": meeting.get('recording_count', len(recording_files)),
-                                    "total_size": meeting.get('total_size', 0),
-                                    "recording_files": recording_files
-                                }
-                                all_recordings.append(meeting_data)
-                                
-                                # Debug output
-                                file_types = [rf['recording_type'] for rf in recording_files]
-                                print(f"     ✅ '{meeting.get('topic', 'Unknown')}' - {len(recording_files)} files: {', '.join(file_types)}")
-                        
-                        # Check for next page
-                        next_page_token = data.get("next_page_token")
-                        if next_page_token:
-                            params["next_page_token"] = next_page_token
-                            page_num += 1
-                        else:
-                            break
-                            
-                    else:
-                        error_data = r.json() if r.content else {"error": "No response content"}
-                        print(f"   ❌ API Error: {r.status_code} - {error_data}")
-                        if r.status_code == 429:  # Rate limit
-                            print("   ⏳ Rate limited - waiting 60 seconds...")
-                            time.sleep(60)
-                            continue
-                        break
-                        
-                except Exception as e:
-                    print(f"   ❌ Exception: {e}")
-                    break
-            
-            total_meetings_found += period_meetings
-            print(f"   📊 Period summary: {period_meetings} meetings with recordings")
-        
-        print(f"\n📊 SEARCH COMPLETE:")
-        print(f"   🔍 Total meetings found across all periods: {total_meetings_found}")
-        print(f"   📁 Meetings with recording files: {len(all_recordings)}")
-        print(f"   📧 User: {user_email}")
-        
-        if len(all_recordings) == 0:
-            print("\n⚠️  NO RECORDINGS FOUND - Possible reasons:")
-            print("   1. No cloud recordings in the searched date ranges")
-            print("   2. Recordings are stored locally (not in cloud)")
-            print("   3. Missing API scopes - check Zoom app permissions")
-            print("   4. User has no recorded meetings")
-            print("   5. Recordings were deleted")
-        
-        return all_recordings
-    
-    def create_meeting_key(self, topic, start_time, meeting_id, recording_type, file_type):
-        """Create unique key for meeting + recording type to avoid re-downloads"""
-        # Clean topic for consistent comparison
-        clean_topic = "".join(c.lower() for c in topic if c.isalnum() or c.isspace()).strip()
-        clean_topic = " ".join(clean_topic.split())  # Normalize whitespace
-        
-        # Use date (YYYY-MM-DD) from start_time
-        date_part = start_time[:10] if start_time else "unknown_date"
-        
-        # Create composite key: topic + date + meeting_id + recording_type + file_type
-        key_content = f"{clean_topic}_{date_part}_{meeting_id}_{recording_type}_{file_type}"
-        
-        # Return hash for consistent length
-        return hashlib.md5(key_content.encode()).hexdigest()[:16]
-    
-    def download_recording(self, download_url, local_path):
-        """Download a recording file with progress"""
-        try:
-            print(f"📥 Downloading to {local_path}")
-            
-            # Stream download for large files
-            response = requests.get(download_url, stream=True)
-            response.raise_for_status()
-            
-            total_size = int(response.headers.get('content-length', 0))
-            downloaded = 0
-            
-            with open(local_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        
-                        # Show progress every 10MB
-                        if downloaded % (10 * 1024 * 1024) == 0:
-                            if total_size > 0:
-                                percent = (downloaded / total_size) * 100
-                                print(f"   Progress: {percent:.1f}% ({downloaded/(1024*1024):.1f}MB)")
-            
-            print(f"✅ Downloaded {local_path.name} ({downloaded/(1024*1024):.1f}MB)")
-            return True
-            
-        except Exception as e:
-            print(f"❌ Download failed for {local_path}: {e}")
-            return False
-    
-    def process_recordings(self, user_emails):
-        """Main method to download all recordings from multiple users"""
-        if isinstance(user_emails, str):
-            user_emails = [user_emails]
-        
-        all_downloaded = []
-        
-        for user_email in user_emails:
-            print(f"\n🔍 Processing recordings for {user_email}")
-            recordings = self.get_all_recordings(user_email)
-            
-            for recording in recordings:
-                meeting_id = recording['meeting_id']
-                topic = recording['topic']
-                start_time = recording['start_time']
-                
-                # Create meeting folder
-                safe_topic = "".join(c for c in topic if c.isalnum() or c in (' ', '-', '_')).rstrip()[:50]
-                date_str = start_time[:10]  # YYYY-MM-DD
-                meeting_folder = self.downloads_dir / f"{date_str}_{safe_topic}_{meeting_id}"
-                meeting_folder.mkdir(exist_ok=True)
-                
-                # Download each recording file
-                for rf in recording['recording_files']:
-                    meeting_key = self.create_meeting_key(
-                        topic, start_time, meeting_id, rf['recording_type'], rf['file_type']
-                    )
-                    
-                    # Skip if already processed
-                    if meeting_key in self.processed_meetings:
-                        print(f"⏭️  Skipping already downloaded: {topic} - {rf['recording_type']} ({rf['file_type']})")
-                        print(f"     Meeting key: {meeting_key}")
-                        continue
-                    
-                    if not rf['download_url']:
-                        print(f"⚠️  No download URL for {rf['recording_type']}")
-                        continue
-                    
-                    # Create filename
-                    file_ext = rf.get('file_extension', rf['file_type'].lower())
-                    if not file_ext.startswith('.'):
-                        file_ext = f".{file_ext}"
-                    
-                    filename = f"{rf['recording_type']}{file_ext}"
-                    local_path = meeting_folder / filename
-                    
-                    # Download file
-                    if self.download_recording(rf['download_url'], local_path):
-                        # Mark as processed
-                        self.processed_meetings.add(meeting_key)
-                        
-                        # Save metadata
-                        file_metadata = {
-                            "meeting_key": meeting_key,
-                            "user_email": user_email,
-                            "meeting_id": meeting_id,
-                            "topic": topic,
-                            "start_time": start_time,
-                            "duration": recording['duration'],
-                            "recording_type": rf['recording_type'],
-                            "file_type": rf['file_type'],
-                            "file_size": rf['file_size'],
-                            "local_path": str(local_path),
-                            "downloaded_at": datetime.now().isoformat(),
-                            "date_key": start_time[:10] if start_time else "unknown"
-                        }
-                        
-                        all_downloaded.append(file_metadata)
-                        
-                        # Save after each successful download to prevent data loss
-                        self.save_processed_meetings()
-        
-        # Save download metadata
-        metadata_file = self.metadata_dir / f"downloads_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        with open(metadata_file, 'w') as f:
-            json.dump(all_downloaded, f, indent=2)
-        
-        print(f"\n✅ Download complete! Metadata saved to {metadata_file}")
-        print(f"📊 Total files downloaded: {len(all_downloaded)}")
-        
-        return all_downloaded
 
-def main():
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Download Zoom recordings")
-    parser.add_argument("--emails", nargs="+", 
-                       default=["cordobahouseschool3@gmail.com"],
-                       help="User emails to process")
-    parser.add_argument("--show-processed", action="store_true",
-                       help="Show what's already been processed")
-    parser.add_argument("--clear-cache", action="store_true", 
-                       help="Clear processed cache (force re-download)")
-    parser.add_argument("--verbose", "-v", action="store_true",
-                       help="Verbose output")
-    
-    args = parser.parse_args()
-    
-    # Initialize downloader
-    downloader = ZoomDownloader()
-    
-    # Handle special commands
-    if args.show_processed:
-        downloader.show_processed_summary()
-        return
-    
-    if args.clear_cache:
-        downloader.clear_processed_cache()
-        return
-    
-    # Show current status
-    if args.verbose or len(downloader.processed_meetings) > 0:
-        downloader.show_processed_summary()
-        print()
-    
-    # Process recordings
-    downloaded_files = downloader.process_recordings(args.emails)
-    
-    print(f"\n🎉 Download pipeline complete!")
-    print(f"📊 Total files downloaded this session: {len(downloaded_files)}")
-    print(f"📁 Files saved in: {downloader.downloads_dir}")
-    print(f"📋 Metadata saved in: {downloader.metadata_dir}")
-    
-    if len(downloaded_files) == 0:
-        print("💡 All files may already be downloaded. Use --show-processed to see what's cached.")
-        print("💡 Use --clear-cache to force re-download everything.")
+    def create_meeting_key(self, topic, start_time, meeting_id, rec_type, file_type):
+        clean = "".join(c.lower() for c in topic if c.isalnum() or c.isspace()).strip()
+        date = start_time[:10] if start_time else "unknown"
+        key = f"{clean}_{date}_{meeting_id}_{rec_type}_{file_type}"
+        return hashlib.md5(key.encode()).hexdigest()[:16]
+
+    def download_recording(self, url, path):
+        if self.verbose:
+            print(f"📥 Downloading {path.name}")
+        resp = requests.get(url, stream=True)
+        resp.raise_for_status()
+        with open(path, 'wb') as f:
+            for chunk in resp.iter_content(8192):
+                if chunk:
+                    f.write(chunk)
+        return True
+
+    def get_all_recordings(self, email):
+        token = self.get_zoom_token()
+        user_id = self.get_user_id(email, token)
+        headers = {"Authorization": f"Bearer {token}"}
+        all_recs = []
+        found = set()
+        ranges = [
+            ("2018-01-01","2019-12-31"),("2020-01-01","2020-12-31"),
+            ("2021-01-01","2021-12-31"),("2022-01-01","2022-12-31"),
+            ("2023-01-01","2023-12-31"),("2024-01-01","2024-12-31"),
+            ("2025-01-01","2025-12-31"),
+        ]
+        base = f"{self.api_base}/users/{user_id}/recordings"
+        for start, end in ranges:
+            if self.verbose:
+                print(f"🔍 Searching {start} to {end}")
+            params = {"page_size":300, "from":start, "to":end}
+            while True:
+                r = requests.get(base, headers=headers, params=params)
+                if not r.ok:
+                    if r.status_code==429:
+                        time.sleep(30); continue
+                    break
+                data = r.json()
+                for m in data.get('meetings',[]):
+                    mid = m.get('id')
+                    if mid in found: continue
+                    found.add(mid)
+                    files = []
+                    for rf in m.get('recording_files',[]):
+                        files.append({
+                            'recording_type': rf.get('recording_type'),
+                            'file_type': rf.get('file_type'),
+                            'file_size': rf.get('file_size',0),
+                            'download_url': rf.get('download_url')+f"?access_token={token}" if rf.get('download_url') else None,
+                        })
+                    if files:
+                        all_recs.append({
+                            'user_email': email,
+                            'meeting_id': mid,
+                            'topic': m.get('topic'),
+                            'start_time': m.get('start_time'),
+                            'duration': m.get('duration'),
+                            'recording_files': files
+                        })
+                token_next = data.get('next_page_token')
+                if token_next:
+                    params['next_page_token'] = token_next
+                    continue
+                break
+        return all_recs
+
+    def process_recordings(self, emails):
+        if isinstance(emails, str): emails = [emails]
+        all_meta = []
+        for email in emails:
+            if self.verbose:
+                print(f"\n➡️ Processing {email}")
+            recs = self.get_all_recordings(email)
+            for rec in recs:
+                date = rec['start_time'][:10]
+                safe = "".join(c for c in rec['topic'] if c.isalnum() or c in (' ','_')).strip()[:50]
+                folder = self.downloads_dir / f"{date}_{safe}_{rec['meeting_id']}"
+                folder.mkdir(exist_ok=True)
+                for rf in rec['recording_files']:
+                    key = self.create_meeting_key(rec['topic'], rec['start_time'], rec['meeting_id'], rf['recording_type'], rf['file_type'])
+                    if key in self.processed_meetings: continue
+                    if not rf['download_url']: continue
+                    ext = rf['file_type'].lower()
+                    fname = f"{rf['recording_type']}.{ext}"
+                    path = folder / fname
+                    if self.download_recording(rf['download_url'], path):
+                        self.processed_meetings.add(key)
+                        meta = {
+                            'meeting_key': key,
+                            'user_email': email,
+                            'meeting_id': rec['meeting_id'],
+                            'topic': rec['topic'],
+                            'start_time': rec['start_time'],
+                            'recording_type': rf['recording_type'],
+                            'file_type': rf['file_type'],
+                            'file_size': rf['file_size'],
+                            'local_path': str(path),
+                            'downloaded_at': datetime.now().isoformat(),
+                            'date_key': date
+                        }
+                        all_meta.append(meta)
+                        self.save_processed_meetings()
+        out = self.metadata_dir / f"downloads_{datetime.now():%Y%m%d_%H%M%S}.json"
+        with open(out,'w') as f: json.dump(all_meta, f, indent=2)
+        print(f"✅ Downloaded {len(all_meta)} files → {out}")
+        return all_meta
+
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser(description="Zoom Recording Downloader")
+    p.add_argument('--emails', nargs='+', default=["cordobahouseschool3@gmail.com"], help="Zoom user emails")
+    p.add_argument('--show-processed', action='store_true', help="Show processed summary")
+    p.add_argument('--clear-cache', action='store_true', help="Clear cache")
+    p.add_argument('--verbose', '-v', action='store_true', help="Verbose output")
+    args = p.parse_args()
+
+    dl = ZoomDownloader(verbose=args.verbose)
+    if args.clear_cache:
+        dl.clear_processed_cache()
+        exit()
+    if args.show_processed:
+        dl.show_processed_summary()
+        exit()
+
+    dl.process_recordings(args.emails)

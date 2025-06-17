@@ -116,21 +116,76 @@ class NazDetectionPipeline:
         
         if not reference_files:
             print(f"❌ No reference audio files found in {self.reference_audio_dir}")
-            print(f"   Please add Naz's voice samples to this directory")
+            print(f"\n📋 REFERENCE AUDIO SETUP GUIDE:")
+            print(f"   1. Find recordings where you KNOW Naz is speaking")
+            print(f"   2. Extract 15-30 second clips of CLEAR Naz speech")
+            print(f"   3. Ensure NO overlapping voices in the clips")
+            print(f"   4. Save as WAV, MP3, or M4A in {self.reference_audio_dir}/")
+            print(f"   5. Use descriptive names: naz_sample_1.wav, naz_meeting_2.mp3")
+            print(f"\n💡 QUALITY TIPS:")
+            print(f"   • 3-5 different samples work best")
+            print(f"   • 15-30 seconds each (longer = better)")
+            print(f"   • Clear speech, minimal background noise")
+            print(f"   • Different contexts (meetings, different dates)")
+            print(f"   • Avoid very short clips (<5 seconds)")
+            print(f"\n🎯 RECOMMENDED AUDIO LENGTH:")
+            print(f"   • Minimum: 10 seconds per sample")
+            print(f"   • Optimal: 20-30 seconds per sample") 
+            print(f"   • Total: 60-150 seconds across 3-5 samples")
+            print(f"   • More samples = better accuracy")
             return False
         
         print(f"🎯 Creating Naz reference embedding from {len(reference_files)} files...")
         
         embeddings = []
+        total_duration = 0
+        
         for ref_file in reference_files:
             print(f"   Processing: {ref_file.name}")
-            embedding = self.get_speaker_embedding(ref_file)
+            
+            # Check file duration
+            try:
+                import librosa
+                duration = librosa.get_duration(filename=ref_file)
+                total_duration += duration
+                print(f"     Duration: {duration:.1f} seconds")
+                
+                if duration < 5:
+                    print(f"     ⚠️  Very short clip - consider longer samples for better accuracy")
+                elif duration < 10:
+                    print(f"     ⚠️  Short clip - 15-30 seconds recommended")
+                elif duration > 60:
+                    print(f"     ℹ️  Long clip - will use first 30 seconds")
+                else:
+                    print(f"     ✅ Good duration")
+                
+            except:
+                print(f"     ⚠️  Could not determine duration")
+            
+            embedding = self.get_speaker_embedding(ref_file, duration_limit=30)
             if embedding is not None:
                 embeddings.append(embedding)
+                print(f"     ✅ Embedding created")
+            else:
+                print(f"     ❌ Failed to create embedding")
         
         if not embeddings:
             print("❌ Failed to create any embeddings from reference files")
+            print("💡 Check that audio files are valid and contain clear speech")
             return False
+        
+        print(f"\n📊 Reference Audio Summary:")
+        print(f"   • Total samples: {len(reference_files)}")
+        print(f"   • Successful embeddings: {len(embeddings)}")
+        print(f"   • Total audio duration: {total_duration:.1f} seconds")
+        print(f"   • Average per sample: {total_duration/len(reference_files):.1f} seconds")
+        
+        if total_duration < 30:
+            print(f"   ⚠️  SHORT TOTAL DURATION - recommend 60+ seconds total")
+        elif total_duration < 60:
+            print(f"   ⚠️  LOW TOTAL DURATION - recommend 90+ seconds for best accuracy")
+        else:
+            print(f"   ✅ Good total duration")
         
         # Average multiple embeddings for robustness
         self.naz_embedding = np.mean(embeddings, axis=0)
@@ -138,6 +193,7 @@ class NazDetectionPipeline:
         # Save the reference embedding
         np.save(reference_embedding_file, self.naz_embedding)
         print(f"✅ Naz reference embedding created and saved")
+        print(f"💡 You can now run Naz detection on recordings")
         
         return True
     

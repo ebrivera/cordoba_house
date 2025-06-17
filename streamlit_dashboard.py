@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 from datetime import datetime
 import subprocess
 import sys
+import time
 
 # Page config
 st.set_page_config(
@@ -42,28 +43,153 @@ class PipelineDashboard:
         return None
     
     def run_pipeline_step(self, step_name, script_name):
-        """Run a pipeline step"""
+        """Run a pipeline step with live console output"""
         try:
+            # Create a container for live output
+            output_container = st.empty()
+            log_container = st.empty()
+            
             with st.spinner(f"Running {step_name}..."):
-                result = subprocess.run([sys.executable, script_name], 
-                                      capture_output=True, text=True, timeout=3600)
+                # Start process
+                process = subprocess.Popen(
+                    [sys.executable, script_name], 
+                    stdout=subprocess.PIPE, 
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True
+                )
                 
-                if result.returncode == 0:
+                # Collect output in real-time
+                stdout_lines = []
+                stderr_lines = []
+                
+                # Read output line by line
+                while True:
+                    # Check if process has finished
+                    if process.poll() is not None:
+                        break
+                    
+                    # Read any available output
+                    try:
+                        import select
+                        ready, _, _ = select.select([process.stdout, process.stderr], [], [], 0.1)
+                        
+                        if process.stdout in ready:
+                            line = process.stdout.readline()
+                            if line:
+                                stdout_lines.append(line.strip())
+                                # Show last 10 lines in real-time
+                                recent_output = '\n'.join(stdout_lines[-10:])
+                                output_container.code(f"🔄 Live Output:\n{recent_output}")
+                        
+                        if process.stderr in ready:
+                            line = process.stderr.readline()
+                            if line:
+                                stderr_lines.append(line.strip())
+                    except:
+                        # Fallback for systems without select
+                        time.sleep(0.5)
+                
+                # Get final output
+                final_stdout, final_stderr = process.communicate()
+                if final_stdout:
+                    stdout_lines.extend(final_stdout.strip().split('\n'))
+                if final_stderr:
+                    stderr_lines.extend(final_stderr.strip().split('\n'))
+                
+                # Clear the live output
+                output_container.empty()
+                
+                if process.returncode == 0:
                     st.success(f"✅ {step_name} completed successfully!")
-                    st.text("Output:")
-                    st.code(result.stdout)
+                    
+                    # Show summary from output
+                    full_output = '\n'.join(stdout_lines)
+                    
+                    # Extract key metrics from output
+                    metrics = self.extract_metrics_from_output(full_output, step_name)
+                    if metrics:
+                        col1, col2, col3 = st.columns(3)
+                        for i, (key, value) in enumerate(metrics.items()):
+                            with [col1, col2, col3][i % 3]:
+                                st.metric(key, value)
+                    
+                    # Show detailed output in expander
+                    with st.expander("📋 View Detailed Output"):
+                        st.code(full_output, language="text")
                 else:
-                    st.error(f"❌ {step_name} failed!")
-                    st.text("Error:")
-                    st.code(result.stderr)
+                    st.error(f"❌ {step_name} failed! (Exit code: {process.returncode})")
+                    
+                    # Show error output
+                    if stderr_lines:
+                        st.text("❌ Error Output:")
+                        st.code('\n'.join(stderr_lines), language="text")
+                    
+                    if stdout_lines:
+                        st.text("📄 Standard Output:")
+                        st.code('\n'.join(stdout_lines), language="text")
                 
-                return result.returncode == 0
-        except subprocess.TimeoutExpired:
-            st.error(f"⏰ {step_name} timed out (1 hour limit)")
-            return False
+                return process.returncode == 0
+                
         except Exception as e:
             st.error(f"❌ Error running {step_name}: {e}")
             return False
+    
+    def extract_metrics_from_output(self, output, step_name):
+        """Extract key metrics from pipeline output"""
+        metrics = {}
+        
+        if "download" in step_name.lower():
+            # Look for download metrics
+            if "downloaded" in output.lower():
+                lines = output.split('\n')
+                for line in lines:
+                    if "downloaded" in line.lower() and "files" in line.lower():
+                        # Try to extract number
+                        import re
+                        numbers = re.findall(r'\d+', line)
+                        if numbers:
+                            metrics["Files Downloaded"] = numbers[0]
+                        break
+        
+        elif "audio" in step_name.lower():
+            # Look for audio processing metrics
+            if "audio files" in output.lower():
+                lines = output.split('\n')
+                for line in lines:
+                    if "audio files created" in line.lower():
+                        import re
+                        numbers = re.findall(r'\d+', line)
+                        if numbers:
+                            metrics["Audio Files"] = numbers[0]
+                        break
+        
+        elif "transcrib" in step_name.lower():
+            # Look for transcription metrics
+            if "transcribed" in output.lower():
+                lines = output.split('\n')
+                for line in lines:
+                    if "transcribed" in line.lower() and "files" in line.lower():
+                        import re
+                        numbers = re.findall(r'\d+', line)
+                        if numbers:
+                            metrics["Transcribed"] = numbers[0]
+                        break
+        
+        elif "detect" in step_name.lower() or "naz" in step_name.lower():
+            # Look for detection metrics
+            lines = output.split('\n')
+            for line in lines:
+                if "meetings" in line.lower() and "lectures" in line.lower():
+                    import re
+                    numbers = re.findall(r'\d+', line)
+                    if len(numbers) >= 2:
+                        metrics["Meetings"] = numbers[0]
+                        metrics["Lectures"] = numbers[1]
+                    break
+        
+        return metrics
 
 def main():
     dashboard = PipelineDashboard()
@@ -78,7 +204,7 @@ def main():
     st.sidebar.markdown("### Pipeline Steps")
     
     if st.sidebar.button("1️⃣ Download Recordings", type="primary"):
-        dashboard.run_pipeline_step("Download Recordings", "zoom_pipeline.py")
+        dashboard.run_pipeline_step("Download Recordings", "zoom_downloader.py")
         st.rerun()
     
     if st.sidebar.button("2️⃣ Process Audio"):
@@ -95,7 +221,7 @@ def main():
     
     if st.sidebar.button("🔄 Run Full Pipeline"):
         steps = [
-            ("Download Recordings", "zoom_pipeline.py"),
+            ("Download Recordings", "zoom_downloader.py"),
             ("Audio Processing", "audio_processor.py"),
             ("Transcription", "transcription_pipeline.py"),
             ("Naz Detection", "naz_detection_pipeline.py")
