@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 from pathlib import Path
 import json
 from datetime import datetime
-import time
 import hashlib
 
 load_dotenv()
@@ -295,168 +294,162 @@ class ZoomDownloader:
         print(f"\n📊 SEARCH SUMMARY")
         print("=" * 30)
         print(f"Total unique meetings found: {len(found_meetings)}")
-        # This section was broken: it contained two overlapping/duplicated implementations of the "get all recordings" logic.
-        # The correct logic is to only have the "get all recordings for a user across specified date ranges" function body here.
-        # The summary/printout code should NOT be duplicated here, but only run after all_recordings is populated.
-        # So, we keep only the function that fetches all recordings, and summary/printout should be done by the caller.
-
-        def get_all_recordings(self, user_email, date_ranges=None):
-            """Get all recordings for a user across specified date ranges"""
-            if date_ranges is None:
-                # Extended date ranges to catch everything (last 5 years)
-                date_ranges = [
-                    ("2020-01-01", "2020-12-31"),
-                    ("2021-01-01", "2021-12-31"),
-                    ("2022-01-01", "2022-06-30"),
-                    ("2022-07-01", "2022-12-31"), 
-                    ("2023-01-01", "2023-06-30"),
-                    ("2023-07-01", "2023-12-31"),
-                    ("2024-01-01", "2024-06-30"),
-                    ("2024-07-01", "2024-12-31"),
-                    ("2025-01-01", "2025-12-31")
-                ]
+        print(f"Meetings with recording files: {len(all_recordings)}")
+        print(f"Total recording files: {sum(len(m['recording_files']) for m in all_recordings)}")
+        
+        # Show breakdown by year
+        by_year = {}
+        for recording in all_recordings:
+            year = recording['start_time'][:4] if recording['start_time'] else 'Unknown'
+            by_year[year] = by_year.get(year, 0) + 1
+        
+        print(f"\nBreakdown by year:")
+        for year in sorted(by_year.keys()):
+            print(f"   {year}: {by_year[year]} meetings")
+        
+        # If still way fewer than expected, provide guidance
+        if len(all_recordings) < 50:  # Based on your CSV showing 104
+            print(f"\n⚠️  STILL MISSING RECORDINGS")
+            print(f"Expected ~104 based on your CSV, found {len(all_recordings)}")
+            print(f"\nPossible reasons:")
+            print(f"1. Many recordings are stored locally (not in cloud)")
+            print(f"2. Recordings are in different Zoom accounts")
+            print(f"3. Some recordings have been deleted")
+            print(f"4. API access limitations")
+            print(f"5. Different user accounts used for recording")
+            print(f"\nNext steps:")
+            print(f"• Manually check Zoom web portal")
+            print(f"• Verify which account contains the recordings")
+            print(f"• Check if there are multiple teacher accounts")
+            print(f"• Run diagnostics: python zoom_diagnostics.py")
+        
+        return all_recordings
+        """Get all recordings for a user across specified date ranges"""
+        if date_ranges is None:
+            # Extended date ranges to catch everything (last 5 years)
+            date_ranges = [
+                ("2020-01-01", "2020-12-31"),
+                ("2021-01-01", "2021-12-31"),
+                ("2022-01-01", "2022-06-30"),
+                ("2022-07-01", "2022-12-31"), 
+                ("2023-01-01", "2023-06-30"),
+                ("2023-07-01", "2023-12-31"),
+                ("2024-01-01", "2024-06-30"),
+                ("2024-07-01", "2024-12-31"),
+                ("2025-01-01", "2025-12-31")
+            ]
+        
+        token = self.get_zoom_token()
+        user_id = self.get_user_id(user_email, token)
+        
+        all_recordings = []
+        total_meetings_found = 0
+        
+        for start_date, end_date in date_ranges:
+            print(f"📅 Searching {start_date} to {end_date} for {user_email}")
             
-            token = self.get_zoom_token()
-            user_id = self.get_user_id(user_email, token)
+            url = f"{self.api_base}/users/{user_id}/recordings"
+            headers = {"Authorization": f"Bearer {token}"}
+            params = {
+                "page_size": 300,  # Maximum allowed
+                "from": start_date,
+                "to": end_date,
+                "mc": "false"  # Include meetings without recordings
+            }
             
-            all_recordings = []
-            total_meetings_found = 0
+            page_num = 1
+            period_meetings = 0
             
-            for start_date, end_date in date_ranges:
-                print(f"📅 Searching {start_date} to {end_date} for {user_email}")
-                
-                url = f"{self.api_base}/users/{user_id}/recordings"
-                headers = {"Authorization": f"Bearer {token}"}
-                params = {
-                    "page_size": 300,  # Maximum allowed
-                    "from": start_date,
-                    "to": end_date,
-                    "mc": "false"  # Include meetings without recordings
-                }
-                
-                page_num = 1
-                period_meetings = 0
-                
-                while True:
-                    try:
-                        r = requests.get(url, headers=headers, params=params)
-                        if r.ok:
-                            data = r.json()
-                            meetings = data.get("meetings", [])
-                            page_count = data.get("page_count", 1)
-                            total_size = data.get("total_size", 0)
+            while True:
+                try:
+                    r = requests.get(url, headers=headers, params=params)
+                    if r.ok:
+                        data = r.json()
+                        meetings = data.get("meetings", [])
+                        page_count = data.get("page_count", 1)
+                        total_size = data.get("total_size", 0)
+                        
+                        print(f"   Page {page_num}/{page_count}: Found {len(meetings)} meetings (Total in period: {total_size})")
+                        period_meetings += len(meetings)
+                        
+                        for meeting in meetings:
+                            recording_files = []
+                            raw_files = meeting.get('recording_files', [])
                             
-                            print(f"   Page {page_num}/{page_count}: Found {len(meetings)} meetings (Total in period: {total_size})")
-                            period_meetings += len(meetings)
-                            
-                            for meeting in meetings:
-                                recording_files = []
-                                raw_files = meeting.get('recording_files', [])
-                                
-                                # Debug: show what we're finding
-                                if len(raw_files) == 0:
-                                    print(f"     ⚠️  Meeting '{meeting.get('topic', 'Unknown')}' has no recording files")
-                                    continue
-                                
-                                for rf in raw_files:
-                                    # Include ALL file types
-                                    recording_files.append({
-                                        "recording_type": rf.get('recording_type'),
-                                        "file_type": rf.get('file_type'),
-                                        "file_size": rf.get('file_size', 0),
-                                        "download_url": f"{rf['download_url']}?access_token={token}" if rf.get('download_url') else None,
-                                        "file_extension": rf.get('file_extension', rf.get('file_type', '').lower()),
-                                        "recording_start": rf.get('recording_start', ''),
-                                        "recording_end": rf.get('recording_end', ''),
-                                        "status": rf.get('status', 'completed')
-                                    })
-                                
-                                if recording_files:  # Only include meetings with actual recording files
-                                    meeting_data = {
-                                        "user_email": user_email,
-                                        "topic": meeting.get('topic'),
-                                        "start_time": meeting.get('start_time'),
-                                        "duration": meeting.get('duration'),
-                                        "meeting_id": meeting.get('id'),
-                                        "uuid": meeting.get('uuid'),  # Add UUID for better tracking
-                                        "recording_count": meeting.get('recording_count', len(recording_files)),
-                                        "total_size": meeting.get('total_size', 0),
-                                        "recording_files": recording_files
-                                    }
-                                    all_recordings.append(meeting_data)
-                                    
-                                    # Debug output
-                                    file_types = [rf['recording_type'] for rf in recording_files]
-                                    print(f"     ✅ '{meeting.get('topic', 'Unknown')}' - {len(recording_files)} files: {', '.join(file_types)}")
-                            
-                            # Check for next page
-                            next_page_token = data.get("next_page_token")
-                            if next_page_token:
-                                params["next_page_token"] = next_page_token
-                                page_num += 1
-                            else:
-                                break
-                                
-                        else:
-                            error_data = r.json() if r.content else {"error": "No response content"}
-                            print(f"   ❌ API Error: {r.status_code} - {error_data}")
-                            if r.status_code == 429:  # Rate limit
-                                print("   ⏳ Rate limited - waiting 60 seconds...")
-                                time.sleep(60)
+                            # Debug: show what we're finding
+                            if len(raw_files) == 0:
+                                print(f"     ⚠️  Meeting '{meeting.get('topic', 'Unknown')}' has no recording files")
                                 continue
+                            
+                            for rf in raw_files:
+                                # Include ALL file types
+                                recording_files.append({
+                                    "recording_type": rf.get('recording_type'),
+                                    "file_type": rf.get('file_type'),
+                                    "file_size": rf.get('file_size', 0),
+                                    "download_url": f"{rf['download_url']}?access_token={token}" if rf.get('download_url') else None,
+                                    "file_extension": rf.get('file_extension', rf.get('file_type', '').lower()),
+                                    "recording_start": rf.get('recording_start', ''),
+                                    "recording_end": rf.get('recording_end', ''),
+                                    "status": rf.get('status', 'completed')
+                                })
+                            
+                            if recording_files:  # Only include meetings with actual recording files
+                                meeting_data = {
+                                    "user_email": user_email,
+                                    "topic": meeting.get('topic'),
+                                    "start_time": meeting.get('start_time'),
+                                    "duration": meeting.get('duration'),
+                                    "meeting_id": meeting.get('id'),
+                                    "uuid": meeting.get('uuid'),  # Add UUID for better tracking
+                                    "recording_count": meeting.get('recording_count', len(recording_files)),
+                                    "total_size": meeting.get('total_size', 0),
+                                    "recording_files": recording_files
+                                }
+                                all_recordings.append(meeting_data)
+                                
+                                # Debug output
+                                file_types = [rf['recording_type'] for rf in recording_files]
+                                print(f"     ✅ '{meeting.get('topic', 'Unknown')}' - {len(recording_files)} files: {', '.join(file_types)}")
+                        
+                        # Check for next page
+                        next_page_token = data.get("next_page_token")
+                        if next_page_token:
+                            params["next_page_token"] = next_page_token
+                            page_num += 1
+                        else:
                             break
                             
-                    except Exception as e:
-                        print(f"   ❌ Exception: {e}")
+                    else:
+                        error_data = r.json() if r.content else {"error": "No response content"}
+                        print(f"   ❌ API Error: {r.status_code} - {error_data}")
+                        if r.status_code == 429:  # Rate limit
+                            print("   ⏳ Rate limited - waiting 60 seconds...")
+                            time.sleep(60)
+                            continue
                         break
-                
-                total_meetings_found += period_meetings
-                print(f"   📊 Period summary: {period_meetings} meetings with recordings")
+                        
+                except Exception as e:
+                    print(f"   ❌ Exception: {e}")
+                    break
             
-            print(f"\n📊 SEARCH COMPLETE:")
-            print(f"   🔍 Total meetings found across all periods: {total_meetings_found}")
-            print(f"   📁 Meetings with recording files: {len(all_recordings)}")
-            print(f"   📧 User: {user_email}")
-            
-            if len(all_recordings) == 0:
-                print("\n⚠️  NO RECORDINGS FOUND - Possible reasons:")
-                print("   1. No cloud recordings in the searched date ranges")
-                print("   2. Recordings are stored locally (not in cloud)")
-                print("   3. Missing API scopes - check Zoom app permissions")
-                print("   4. User has no recorded meetings")
-                print("   5. Recordings were deleted")
-            
-            # Print summary breakdown
-            print(f"Meetings with recording files: {len(all_recordings)}")
-            print(f"Total recording files: {sum(len(m['recording_files']) for m in all_recordings)}")
-            
-            # Show breakdown by year
-            by_year = {}
-            for recording in all_recordings:
-                year = recording['start_time'][:4] if recording['start_time'] else 'Unknown'
-                by_year[year] = by_year.get(year, 0) + 1
-            
-            print(f"\nBreakdown by year:")
-            for year in sorted(by_year.keys()):
-                print(f"   {year}: {by_year[year]} meetings")
-            
-            # If still way fewer than expected, provide guidance
-            if len(all_recordings) < 50:  # Based on your CSV showing 104
-                print(f"\n⚠️  STILL MISSING RECORDINGS")
-                print(f"Expected ~104 based on your CSV, found {len(all_recordings)}")
-                print(f"\nPossible reasons:")
-                print(f"1. Many recordings are stored locally (not in cloud)")
-                print(f"2. Recordings are in different Zoom accounts")
-                print(f"3. Some recordings have been deleted")
-                print(f"4. API access limitations")
-                print(f"5. Different user accounts used for recording")
-                print(f"\nNext steps:")
-                print(f"• Manually check Zoom web portal")
-                print(f"• Verify which account contains the recordings")
-                print(f"• Check if there are multiple teacher accounts")
-                print(f"• Run diagnostics: python zoom_diagnostics.py")
-            
-            return all_recordings
+            total_meetings_found += period_meetings
+            print(f"   📊 Period summary: {period_meetings} meetings with recordings")
+        
+        print(f"\n📊 SEARCH COMPLETE:")
+        print(f"   🔍 Total meetings found across all periods: {total_meetings_found}")
+        print(f"   📁 Meetings with recording files: {len(all_recordings)}")
+        print(f"   📧 User: {user_email}")
+        
+        if len(all_recordings) == 0:
+            print("\n⚠️  NO RECORDINGS FOUND - Possible reasons:")
+            print("   1. No cloud recordings in the searched date ranges")
+            print("   2. Recordings are stored locally (not in cloud)")
+            print("   3. Missing API scopes - check Zoom app permissions")
+            print("   4. User has no recorded meetings")
+            print("   5. Recordings were deleted")
+        
+        return all_recordings
     
     def create_meeting_key(self, topic, start_time, meeting_id, recording_type, file_type):
         """Create unique key for meeting + recording type to avoid re-downloads"""
